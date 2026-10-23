@@ -1,22 +1,21 @@
 widget "locket" {
-  page: 1
-  order: 6
   size: 3x3
   minSize: 2x2
   padding: 0
 
   meta {
     owl: 11
-    description: "Official Locket widget for OmaLauncher: live moments from friends, instant push sync, emoji & text reactions, and account sign-in"
-    version: "1.5"
+    description: "Unofficial Locket widget: live photo moments from friends, emoji reactions, chat replies, and account sign-in"
+    version: "1.6"
     license: "MIT"
     category: "media"
   }
 
-  source now = clock every 1m
+  source now = clock every 20m
   source notifs = android.notifications
 
-  // Persistent Locket session & cached feed (capped to 12 slim items to stay well under the 32-image limit)
+  // Persistent Locket session, per-install device ID & cached feed (capped to 12 slim items)
+  state installationId = range(22).map(i => ["0","1","2","3","4","5","6","7","8","9","a","b","c","d","e","f"][random(16)]).join("") persist
   state uid = "" persist
   state email = "" persist
   state idToken = "" persist
@@ -40,12 +39,17 @@ widget "locket" {
   state lastReact = ""
   state lastReactUid = ""
   state replyDrafts = {}
-  state pendingChat = null
+  state lastAttemptedChat = null
+  state retryChat = null
+  state lastAttemptedReact = null
+  state retryReact = null
 
   // Network response states (each watched by its own `on` trigger; no trigger ever writes to the state it watches)
   state authRes = null
   state phoneRes = null
   state refreshRes = null
+  state chatRefreshRes = null
+  state reactRefreshRes = null
   state feedRes = null
   state feedBackfillRes = null
   state userRes = null
@@ -70,7 +74,7 @@ widget "locket" {
   }
   let analytics = {
     ios_version: "2.68.0.2523",
-    installation_id: "8f4b2e1c9a0d3f7e6b5a1c",
+    installation_id: installationId,
     platform: "ios",
     experiments: {
       flag_18: {"@type": "type.googleapis.com/google.protobuf.Int64Value", value: "1203"},
@@ -96,7 +100,7 @@ widget "locket" {
   let safeIdx = countMoments > 0 ? clamp(idx, 0, countMoments - 1) : 0
   let cur = countMoments > 0 ? activeMoments[safeIdx] : null
 
-  // Real-time detection when a friend uploads a new snap via official Locket app notification
+  // Real-time detection when a friend uploads a new snap via Locket app notification
   let latestLocketNotif = ((notifs.items ?? []).find(n =>
     n.package == "com.locket.Locket" || contains(lower(n.package ?? ""), "locket") || contains(lower(n.app ?? ""), "locket")
   ).time) ?? 0
@@ -145,9 +149,11 @@ widget "locket" {
     }
   }
 
-  // Runs immediately on widget start / wake-up after hours of sleep, and every 1 minute while live
+  // Runs on widget start / wake-up and every 20 minutes while live
   on now first {
-    // Trim legacy oversized moment cache once if > 12 items were persisted previously
+    if installationId == "" {
+      installationId = range(22).map(i => ["0","1","2","3","4","5","6","7","8","9","a","b","c","d","e","f"][random(16)]).join("")
+    }
     if len(moments) > 12 {
       moments = moments.take(12)
     }
@@ -164,7 +170,7 @@ widget "locket" {
           {grantType: "refresh_token", refreshToken: refreshToken},
           baseHeaders
         )
-      } else if value - lastSyncAt >= 55 || lastSyncAt > value {
+      } else if value - lastSyncAt >= 1100 || lastSyncAt > value {
         busyUntil = value + 15
         lastSyncAt = value
         manualSync = false
@@ -181,9 +187,16 @@ widget "locket" {
   // Handle Email / CustomToken login result
   on authRes first {
     if value.ok && value.out.idToken != null {
+      let newUid = value.out.localId ?? uid
+      if uid != "" && newUid != "" && newUid != uid {
+        moments = []
+        users = {}
+        idx = 0
+        replyDrafts = {}
+      }
       idToken = value.out.idToken
       refreshToken = value.out.refreshToken ?? refreshToken
-      uid = value.out.localId ?? uid
+      uid = newUid
       email = value.out.email ?? email
       tokenExp = (now ?? 0) + num(value.out.expiresIn, 3600)
       lastSyncAt = now ?? 0
@@ -195,7 +208,14 @@ widget "locket" {
       feedRes = null
       feedRes = post(
         "https://api.locketcamera.com/getLatestMomentV2",
-        feedPayload,
+        {
+          data: {
+            excluded_users: newUid != "" ? [newUid] : [],
+            should_count_missed_moments: true,
+            include_group_moments: true,
+            analytics: analytics
+          }
+        },
         {
           "Authorization": "Bearer ${value.out.idToken}",
           "User-Agent": ua,
@@ -226,8 +246,60 @@ widget "locket" {
     }
   }
 
-  // Handle Refresh Token renewal (and automatically retry any pending reply/reaction or fetch feed)
+  // Handle routine Refresh Token renewal (feed sync / sign-in only; never resends chat or reactions)
   on refreshRes first {
+    if value.ok && value.out.id_token != null {
+      let freshToken = value.out.id_token
+      let freshUid = value.out.user_id ?? uid
+      let freshHeaders = {
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer ${freshToken}",
+        "User-Agent": ua,
+        "x-ios-bundle-identifier": "com.locket.Locket"
+      }
+      if uid != "" && freshUid != "" && freshUid != uid {
+        moments = []
+        users = {}
+        idx = 0
+        replyDrafts = {}
+      }
+      idToken = freshToken
+      refreshToken = value.out.refresh_token ?? refreshToken
+      uid = freshUid
+      tokenExp = (now ?? 0) + num(value.out.expires_in, 3600)
+      lastSyncAt = now ?? 0
+      tab = "feed"
+      busyUntil = (now ?? 0) + 15
+      if manualSync {
+        statusMsg = "Session refreshed! Syncing moments…"
+      }
+      feedRes = null
+      feedRes = post(
+        "https://api.locketcamera.com/getLatestMomentV2",
+        {
+          data: {
+            excluded_users: freshUid != "" ? [freshUid] : [],
+            should_count_missed_moments: true,
+            include_group_moments: true,
+            analytics: analytics
+          }
+        },
+        freshHeaders
+      )
+    } else {
+      busyUntil = 0
+      manualSync = false
+      let errMsg = value.out.error.message ?? "HTTP ${value.code}"
+      statusMsg = "Token refresh failed (${errMsg})"
+    }
+  }
+
+  // Handle Refresh Token renewal started specifically by a 401 on sendChatMessageV2
+  on chatRefreshRes first {
+    let pc = retryChat
+    retryChat = null
+    lastAttemptedChat = null
     if value.ok && value.out.id_token != null {
       let freshToken = value.out.id_token
       let freshHeaders = {
@@ -241,32 +313,8 @@ widget "locket" {
       refreshToken = value.out.refresh_token ?? refreshToken
       uid = value.out.user_id ?? uid
       tokenExp = (now ?? 0) + num(value.out.expires_in, 3600)
-      lastSyncAt = now ?? 0
-      tab = "feed"
-      if pendingChat != null {
-        let pc = pendingChat
-        pendingChat = null
-        busyUntil = 0
+      if pc != null {
         statusMsg = "Sending '${pc.msg}'…"
-        if pc.isEmoji {
-          reactRes = null
-          reactRes = post(
-            "https://api.locketcamera.com/reactToMoment",
-            {
-              data: {
-                moment_uid: pc.moment_uid,
-                reaction: pc.msg,
-                from_memory: false,
-                intensity: {
-                  "@type": "type.googleapis.com/google.protobuf.Int64Value",
-                  value: "0"
-                },
-                analytics: analytics
-              }
-            },
-            freshHeaders
-          )
-        }
         chatRes = null
         chatRes = post(
           "https://api.locketcamera.com/sendChatMessageV2",
@@ -286,23 +334,54 @@ widget "locket" {
           },
           freshHeaders
         )
-      } else {
-        busyUntil = (now ?? 0) + 15
-        if manualSync {
-          statusMsg = "Session refreshed! Syncing moments…"
-        }
-        feedRes = null
-        feedRes = post(
-          "https://api.locketcamera.com/getLatestMomentV2",
-          feedPayload,
+      }
+    } else {
+      let errMsg = value.out.error.message ?? "HTTP ${value.code}"
+      statusMsg = "Reply failed: token refresh error (${errMsg})"
+    }
+  }
+
+  // Handle Refresh Token renewal started specifically by a 401 on reactToMoment
+  on reactRefreshRes first {
+    let pr = retryReact
+    retryReact = null
+    lastAttemptedReact = null
+    if value.ok && value.out.id_token != null {
+      let freshToken = value.out.id_token
+      let freshHeaders = {
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer ${freshToken}",
+        "User-Agent": ua,
+        "x-ios-bundle-identifier": "com.locket.Locket"
+      }
+      idToken = freshToken
+      refreshToken = value.out.refresh_token ?? refreshToken
+      uid = value.out.user_id ?? uid
+      tokenExp = (now ?? 0) + num(value.out.expires_in, 3600)
+      if pr != null {
+        statusMsg = "Sending ${pr.reaction} reaction…"
+        reactRes = null
+        reactRes = post(
+          "https://api.locketcamera.com/reactToMoment",
+          {
+            data: {
+              moment_uid: pr.moment_uid,
+              reaction: pr.reaction,
+              from_memory: false,
+              intensity: {
+                "@type": "type.googleapis.com/google.protobuf.Int64Value",
+                value: "0"
+              },
+              analytics: analytics
+            }
+          },
           freshHeaders
         )
       }
     } else {
-      busyUntil = 0
-      manualSync = false
       let errMsg = value.out.error.message ?? "HTTP ${value.code}"
-      statusMsg = "Token refresh failed (${errMsg})"
+      statusMsg = "Reaction failed: token refresh error (${errMsg})"
     }
   }
 
@@ -371,7 +450,7 @@ widget "locket" {
         )
       }
 
-      // On manual sync or when a new moment arrived, do one non-recursive backfill check for other friends
+      // On manual sync, do one non-recursive backfill check for other friends
       if manualSync {
         manualSync = false
         statusMsg = len(newItems) > 0
@@ -457,31 +536,52 @@ widget "locket" {
     requestedUserUid = ""
   }
 
-  // Handle Moment Reaction response
+  // Handle Moment Reaction response (only retries on 401 via dedicated reactRefreshRes)
   on reactRes first {
-    if value.ok && (value.out.result.status == 200 || value.out.status == 200) {
-      statusMsg = "Sent ${lastReact} to Locket!"
+    let st = value.out.result.status ?? value.out.status ?? value.code
+    if (value.code == 401 || st == 401) && refreshToken != "" && lastAttemptedReact != null {
+      retryReact = lastAttemptedReact
+      lastAttemptedReact = null
+      statusMsg = "Refreshing session to send reaction…"
+      reactRefreshRes = null
+      reactRefreshRes = post(
+        "https://securetoken.googleapis.com/v1/token?key=${enc(apiKey)}",
+        {grantType: "refresh_token", refreshToken: refreshToken},
+        baseHeaders
+      )
+    } else if value.ok && st == 200 {
+      lastAttemptedReact = null
+      retryReact = null
+      statusMsg = "Sent ${lastReact} reaction!"
+    } else {
+      lastAttemptedReact = null
+      retryReact = null
+      let errTxt = value.out.result.errors[0] ?? value.out.error.message ?? "status ${st}"
+      statusMsg = "Reaction failed (${errTxt})"
     }
   }
 
-  // Handle Chat Reply / Moment Comment response (sendChatMessageV2)
+  // Handle Chat Reply / Moment Comment response (only retries on 401 via dedicated chatRefreshRes)
   on chatRes first {
     let st = value.out.result.status ?? value.out.status ?? value.code
     let convId = value.out.result.data.conversation_uid ?? value.out.data.conversation_uid
-    if (value.code == 401 || st == 401) && refreshToken != "" && pendingChat != null {
+    if (value.code == 401 || st == 401) && refreshToken != "" && lastAttemptedChat != null {
+      retryChat = lastAttemptedChat
+      lastAttemptedChat = null
       statusMsg = "Refreshing session to send reply…"
-      busyUntil = (now ?? 0) + 20
-      refreshRes = null
-      refreshRes = post(
+      chatRefreshRes = null
+      chatRefreshRes = post(
         "https://securetoken.googleapis.com/v1/token?key=${enc(apiKey)}",
         {grantType: "refresh_token", refreshToken: refreshToken},
         baseHeaders
       )
     } else if value.ok && (st == 200 || convId != null) {
-      pendingChat = null
+      lastAttemptedChat = null
+      retryChat = null
       statusMsg = "Sent '${lastReact}' to Locket chat!"
     } else {
-      pendingChat = null
+      lastAttemptedChat = null
+      retryChat = null
       let errTxt = value.out.result.errors[0] ?? value.out.error.message ?? "status ${st}"
       statusMsg = "Reply failed (${errTxt})"
     }
@@ -493,8 +593,8 @@ widget "locket" {
   Box {
     fill: true
     onTap: {
-      // If returning after idle/sleep, kick off a silent sync right as the screen opens
-      if refreshToken != "" && (now ?? 0) >= busyUntil && ((now ?? 0) - lastSyncAt >= 45 || (now ?? 0) >= tokenExp - 300) {
+      // If returning after 15+ minutes or token expiry, kick off a silent sync as the screen opens
+      if refreshToken != "" && (now ?? 0) >= busyUntil && ((now ?? 0) - lastSyncAt >= 900 || (now ?? 0) >= tokenExp - 300) {
         busyUntil = (now ?? 0) + 15
         lastSyncAt = now ?? 0
         if (now ?? 0) >= tokenExp - 300 || idToken == "" {
@@ -771,7 +871,7 @@ widget "locket" {
                 Text {
                   text: signedIn
                     ? (email != "" ? email : "UID: ${uid}")
-                    : "Sign in with your official Locket email, phone, or refresh token"
+                    : "Unofficial Locket client — sign in with your Locket email, phone, or refresh token"
                   style: small
                   color: muted
                 }
@@ -924,6 +1024,17 @@ widget "locket" {
                     uid = ""
                     email = ""
                     tokenExp = 0
+                    lastSyncAt = 0
+                    moments = []
+                    users = {}
+                    idx = 0
+                    replyDrafts = {}
+                    lastReact = ""
+                    lastReactUid = ""
+                    lastAttemptedChat = null
+                    retryChat = null
+                    lastAttemptedReact = null
+                    retryReact = null
                     busyUntil = 0
                     statusMsg = "Signed out"
                   }
@@ -1058,7 +1169,7 @@ widget "locket" {
                 }
               }
 
-              // Quick Emoji Reaction Row (official Locket reaction palette + chat message)
+              // Quick Emoji Reaction Row (calls reactToMoment only, matching the Locket app)
               Row {
                 align: center
                 gap: 6
@@ -1069,23 +1180,14 @@ widget "locket" {
                     color: lastReactUid == m.canonical_uid && lastReact == emoji ? yellow : muted
                     onTap: {
                       haptic()
-                      let seed = random(1000000, 9999999)
-                      let p1 = range(8).map(k => hexChars[floor(hash(seed, k) * 16)]).join("")
-                      let p2 = range(4).map(k => hexChars[floor(hash(seed, k + 8) * 16)]).join("")
-                      let p3 = "4${range(3).map(k => hexChars[floor(hash(seed, k + 12) * 16)]).join("")}"
-                      let p4 = "9${range(3).map(k => hexChars[floor(hash(seed, k + 15) * 16)]).join("")}"
-                      let p5 = range(12).map(k => hexChars[floor(hash(seed, k + 18) * 16)]).join("")
-                      let cToken = "${p1}-${p2}-${p3}-${p4}-${p5}"
                       lastReact = emoji
                       lastReactUid = m.canonical_uid
-                      pendingChat = {
-                        receiver_uid: m.user,
-                        msg: emoji,
+                      lastAttemptedReact = {
                         moment_uid: m.canonical_uid,
-                        client_token: cToken,
-                        isEmoji: true
+                        reaction: emoji
                       }
-                      statusMsg = "Sending ${emoji} to ${senderName}…"
+                      retryReact = null
+                      statusMsg = "Sending ${emoji} reaction to ${senderName}…"
                       reactRes = null
                       reactRes = post(
                         "https://api.locketcamera.com/reactToMoment",
@@ -1098,25 +1200,6 @@ widget "locket" {
                               "@type": "type.googleapis.com/google.protobuf.Int64Value",
                               value: "0"
                             },
-                            analytics: analytics
-                          }
-                        },
-                        authHeaders
-                      )
-                      chatRes = null
-                      chatRes = post(
-                        "https://api.locketcamera.com/sendChatMessageV2",
-                        {
-                          data: {
-                            receiver_uid: m.user,
-                            msg: emoji,
-                            moment_uid: m.canonical_uid,
-                            from_memory: false,
-                            intensity: {
-                              "value": "0",
-                              "@type": "type.googleapis.com/google.protobuf.Int64Value"
-                            },
-                            client_token: cToken,
                             analytics: analytics
                           }
                         },
@@ -1152,13 +1235,13 @@ widget "locket" {
                       replyDrafts = set(replyDrafts, m.canonical_uid, "")
                       lastReact = msgTxt
                       lastReactUid = m.canonical_uid
-                      pendingChat = {
+                      lastAttemptedChat = {
                         receiver_uid: m.user,
                         msg: msgTxt,
                         moment_uid: m.canonical_uid,
-                        client_token: cToken,
-                        isEmoji: false
+                        client_token: cToken
                       }
+                      retryChat = null
                       statusMsg = "Sending '${msgTxt}' to ${senderName}…"
                       chatRes = null
                       chatRes = post(
@@ -1199,13 +1282,13 @@ widget "locket" {
                       replyDrafts = set(replyDrafts, m.canonical_uid, "")
                       lastReact = msgTxt
                       lastReactUid = m.canonical_uid
-                      pendingChat = {
+                      lastAttemptedChat = {
                         receiver_uid: m.user,
                         msg: msgTxt,
                         moment_uid: m.canonical_uid,
-                        client_token: cToken,
-                        isEmoji: false
+                        client_token: cToken
                       }
+                      retryChat = null
                       statusMsg = "Sending '${msgTxt}' to ${senderName}…"
                       chatRes = null
                       chatRes = post(
